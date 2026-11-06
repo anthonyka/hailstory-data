@@ -1,5 +1,5 @@
 """Add each new storm day to the delta files. Runs once a day on GitHub Actions and needs no secrets."""
-import csv, datetime as dt, gzip, io, json, math, os, struct, sys, urllib.error, urllib.request
+import csv, datetime as dt, gzip, io, json, math, os, struct, sys, time, urllib.error, urllib.request
 
 import numpy as np
 
@@ -17,8 +17,14 @@ TIMES = ['120000', '123000', '113000', '130000', '110000', '133000']
 UA = {'User-Agent': 'hailstory-data updater'}
 
 
+class Unavailable(Exception):
+    """A source failed. The run stops without saving, so the same day is tried again next time."""
+
+
 def get(url, timeout=60):
+    """Return the file, or None if it does not exist yet. Any other failure raises."""
     req = urllib.request.Request(url, headers=UA)
+    problem = None
     for attempt in range(3):
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -26,9 +32,11 @@ def get(url, timeout=60):
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 return None
-        except Exception:
-            pass
-    return None
+            problem = e
+        except Exception as e:
+            problem = e
+        time.sleep(5 * (attempt + 1))
+    raise Unavailable(f'{url}: {problem}')
 
 
 def load_mask():
@@ -43,7 +51,11 @@ def reports(storm_day):
     out = {'hail': [], 'wind': [], 'torn': []}
     for kind in out:
         blob = get(f'{SPC}{tag}_rpts_{kind}.csv')
-        if not blob:
+        if blob is None:
+            age = (dt.datetime.now(dt.timezone.utc).date() - storm_day).days
+            if age <= 4:
+                return None      # reports are not posted yet, so wait for them
+            print('no report file, continuing without it:', tag, kind)
             continue
         for row in csv.reader(io.StringIO(blob.decode('latin1'))):
             if len(row) < 7 or row[0] == 'Time':
@@ -128,12 +140,21 @@ def main():
             if blob:
                 break
         if not blob:
-            print('not available yet', tag)
-            break
+            if (today.date() - next_file_day).days <= 3:
+                print('radar not available yet', tag)
+                break
+            print('radar missing, skipping day', tag)
+            state['skipped'] = state.get('skipped', []) + [tag]
+            state['lastFileDay'] = next_file_day.isoformat()
+            next_file_day += dt.timedelta(1)
+            continue
         storm_day = next_file_day - dt.timedelta(1)
         day_index = (storm_day - DAY0).days
         today_rep = reports(storm_day)
         before = reports(storm_day - dt.timedelta(1))
+        if today_rep is None or before is None:
+            print('reports not available yet', tag)
+            break
         pts = [(r[1], r[2] * 0.8) for r in today_rep['hail'] + before['hail']]
         rows, cols, vals, removed = qc.clean(mrms.decode(blob), mask, np.array(pts) if pts else [], storm_day.month, zones)
         if len(rows):
